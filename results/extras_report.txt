@@ -1,0 +1,285 @@
+
+===== VERSIONS AND SOURCE =====
+python 3.13.15 | pandas 2.3.3 | numpy 2.1.3 | datasets 4.8.5 | openai 2.54.0
+$ ollama --version
+ollama version is 0.40.3
+$ ollama show llama3.1:8b
+Model
+    architecture        llama     
+    parameters          8.0B      
+    context length      131072    
+    embedding length    4096      
+    quantization        Q4_K_M    
+
+  Capabilities
+    completion    
+    tools         
+
+  Parameters
+    stop    "<|start_header_id|>"    
+    stop    "<|end_header_id|>"      
+    stop    "<|eot_id|>"             
+
+  License
+    LLAMA 3.1 COMMUNITY LICENSE AGREEMENT            
+    Llama 3.1 Version Release Date: July 23, 2024    
+    ...
+$ pip show rank_bm25
+Name: rank-bm25
+Version: 0.2.2
+Summary: Various BM25 algorithms for document ranking
+Home-page: https://github.com/dorianbrown/rank_bm25
+Author: D. Brown
+Author-email: dorianstuartbrown@gmail.com
+License: Apache2.0
+Location: /usr/local/lib/python3.13/dist-packages
+Requires: numpy
+Required-by:
+$ nvidia-smi --query-gpu=name --format=csv
+name
+Tesla T4
+Tesla T4
+K 4 | M 4 | T 3 | SEED 13 | evaluation questions 7405
+question types: {'comparison': 1487, 'bridge': 5918}
+PROMPT >>>
+Answer the question using ONLY the passages below.
+If the passages do not contain every fact needed, answer INSUFFICIENT. Do not guess.
+Reply with one JSON object and nothing else, in this form:
+{{"answer": "...", "cites": [...], "missing": "..."}}
+answer: a few words, or INSUFFICIENT.
+cites: the numbers of the passages you used, for example [4] or [1, 6].
+missing: one short search query for the fact you still need, or "" if nothing is missing.
+
+{ctx}
+
+Question: {q}
+def gated(q, P, bm25, cost, vary):
+    pool, rounds = retrieve(bm25, q, [], K, cost), []
+    for t in range(1, T + 1):
+        full = ask(q, pool, P, cost)
+        answered, others = not insufficient(full["answer"]), []
+        if answered and t < T:
+            if vary == "evidence":   # ours: hide one group of pages each time
+                others = [ask(q, [i for i in pool if i not in pool[j::M]], P, cost) for j in range(M)]
+            else:                    # sc: same pages, ask again with randomness
+                others = [ask(q, pool, P, cost, temp=0.7) for _ in range(M)]
+        n_same = sum(same(o["answer"], full["answer"]) for o in others)
+        stop = answered and t < T and n_same == M
+        rounds.append({"t": t, "pool": list(pool), "answered": answered,
+                       "n_same": n_same, "answer": full["answer"]})
+        if stop or t == T: break
+        miss = collections.Counter(o["missing"] for o in [full] + others if o["missing"])
+        queries = [u for u, _ in miss.most_common(2)] or [q + (" " + full["answer"] if answered else "")]
+        for u in queries:            # two new pages per round in total
+            pool += retrieve(bm25, u, pool, 2 // len(queries), cost)
+    return full["answer"], pool, {"rounds": rounds}
+
+def same(a, b): return (not insufficient(a)) and f1(a, b) >= 0.6
+
+def ask(q, ids, P, cost, temp=0.0):
+    ctx = "\n".join(f"[{i}] {P[i]}" for i in ids)
+    for attempt in range(5):
+        try:
+            r = client.chat.completions.create(model=MODEL, temperature=temp, max_tokens=200,
+                messages=[{"role": "user", "content": PROMPT.format(ctx=ctx, q=q)}])
+            break
+        except Exception:
+            time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError("LLM call failed 5 times")
+    cost["gen"] += 1; STATS["calls"] += 1
+    cost["tok"] += r.usage.total_tokens if r.usage else 0
+    o, ok = parse(r.choices[0].message.content or "")
+    if not ok: STATS["bad"] += 1
+    cites = []
+    for c_ in o.get("cites") or []:
+        try:
+            if int(c_) in ids: cites.append(int(c_))
+        except Exception:
+            pass
+    return {"answer": str(o.get("answer") or "INSUFFICIENT").strip(),
+            "cites": cites, "missing": str(o.get("missing") or "").strip()}
+
+def retrieve(bm25, query, pool, k, cost):
+    cost["ret"] += 1
+    scores = bm25.get_scores(query.lower().split())
+    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
+    return [i for i in ranked if i not in pool][:k]
+
+def fixed_depth(q, P, bm25, cost):
+    pool = retrieve(bm25, q, [], K, cost)
+    o = ask(q, pool, P, cost)
+    for _ in range(T - 1):
+        extra = "" if insufficient(o["answer"]) else " " + o["answer"]
+        pool += retrieve(bm25, q + extra, pool, K2, cost)
+        o = ask(q, pool, P, cost)
+    return o["answer"], pool, {}
+
+def single_pass(q, P, bm25, cost):
+    pool = retrieve(bm25, q, [], K, cost)
+    return ask(q, pool, P, cost)["answer"], pool, {}
+
+def run(N, OUT):
+    ds = HOTPOT.shuffle(seed=SEED).select(range(N))
+    done = set()
+    if os.path.exists(OUT):
+        for line in open(OUT):
+            r = json.loads(line); done.add((r["id"], r["method"]))
+    with open(OUT, "a") as f:
+        for n, ex in enumerate(ds, 1):
+            titles = ex["context"]["title"]
+            P = [t + ": " + "".join(s) for t, s in zip(titles, ex["context"]["sentences"])]
+            bm25 = BM25Okapi([p.lower().split() for p in P])
+            gold = set(ex["supporting_facts"]["title"])
+            for name, fn in METHODS.items():
+                if (ex["id"], name) in done: continue
+                cost = {"ret": 0, "gen": 0, "tok": 0}
+                ans, pool, info = fn(ex["question"], P, bm25, cost)
+                row = {"id": ex["id"], "method": name, "type": ex["type"], "pred": ans, "gold": ex["answer"],
+                       "em": int(norm(ans) == norm(ex["answer"])), "f1": f1(ans, ex["answer"]),
+                       "recall": len(gold & {titles[i] for i in pool}) / len(gold),
+                       "rounds": len(info["rounds"]) if "rounds" in info else cost["ret"], **cost}
+                if "rounds" in info:
+                    row["rounds_log"] = [{"t": x["t"], "answered": x["answered"], "n_same": x["n_same"],
+                                          "suff": bool(gold <= {titles[i] for i in x["pool"]}),
+                                          "correct": bool(f1(x["answer"], ex["answer"]) >= 0.6)}
+                                         for x in info["rounds"]]
+                f.write(json.dumps(row) + "\n"); f.flush()
+            if n % 5 == 0: print(f"question {n}/{N} done", flush=True)
+
+
+===== PILOT (100 design questions) =====
+questions 100 | pools sufficient 46
+       answered  correct  n_cite  n_sub_answered  n_same  n_crit
+suff                                                            
+False     0.704    0.259   1.037           2.556   1.796   1.019
+True      0.891    0.696   1.239           3.000   2.587   0.978
+       correct         suff      
+          mean count   mean count
+n_same                           
+0        0.000    24  0.208    24
+1        0.667     6  0.167     6
+2        0.500    12  0.750    12
+3        0.543    46  0.522    46
+4        0.917    12  0.583    12
+gave an answer  | stops on 0.790 | precision 0.519 | recall 0.891 | correct when it stops 0.582
+3+ agree        | stops on 0.580 | precision 0.534 | recall 0.674 | correct when it stops 0.621
+all 4 agree     | stops on 0.120 | precision 0.583 | recall 0.152 | correct when it stops 0.917
+needs 2+ pages  | stops on 0.210 | precision 0.476 | recall 0.217 | correct when it stops 0.476
+cites 2+ pages  | stops on 0.190 | precision 0.579 | recall 0.239 | correct when it stops 0.632
+
+===== EXTRA METRICS =====
+        answered  ungrounded
+method                      
+fixed      0.920       0.087
+ours       0.943       0.217
+sc         0.940       0.283
+single     0.837       0.380
+share of questions ending at each round:
+rounds      1      2      3
+method                     
+fixed   0.000  0.000  1.000
+ours    0.137  0.090  0.773
+sc      0.557  0.183  0.260
+single  1.000  0.000  0.000
+mean f1 by question type:
+type    bridge  comparison
+method                    
+fixed    0.610       0.621
+ours     0.615       0.606
+sc       0.592       0.589
+single   0.466       0.540
+mean em by question type:
+type    bridge  comparison
+method                    
+fixed    0.468       0.492
+ours     0.485       0.462
+sc       0.464       0.462
+single   0.357       0.400
+mean rounds by question type:
+type    bridge  comparison
+method                    
+fixed    3.000       3.000
+ours     2.728       2.308
+sc       1.728       1.615
+single   1.000       1.000
+mean gen by question type:
+type    bridge  comparison
+method                    
+fixed     3.00       3.000
+ours      9.23       8.585
+sc        6.46       6.477
+single    1.00       1.000
+
+===== AGREEMENT COUNT =====
+sc | round 1 by agreement count (0 includes questions with no answer):
+       correct         suff      
+          mean count   mean count
+n_same                           
+0        0.019    53  0.151    53
+1        0.188    16  0.562    16
+2        0.476    21  0.333    21
+3        0.395    43  0.488    43
+4        0.695   167  0.593   167
+sc | round 1, answered questions only:
+       correct         suff      
+          mean count   mean count
+n_same                           
+0        0.200     5  0.400     5
+1        0.188    16  0.562    16
+2        0.476    21  0.333    21
+3        0.395    43  0.488    43
+4        0.695   167  0.593   167
+ours | round 1 by agreement count (0 includes questions with no answer):
+       correct         suff      
+          mean count   mean count
+n_same                           
+0        0.036    56  0.143    56
+1        0.190    21  0.476    21
+2        0.508    59  0.610    59
+3        0.650   123  0.561   123
+4        0.756    41  0.512    41
+ours | round 1, answered questions only:
+       correct         suff      
+          mean count   mean count
+n_same                           
+0        0.250     8  0.250     8
+1        0.190    21  0.476    21
+2        0.508    59  0.610    59
+3        0.650   123  0.561   123
+4        0.756    41  0.512    41
+
+===== WRONG ANSWERS =====
+questions: 300 | wrong answers of ours (F1 < 0.6): 114
+category
+wrong, both gold present, returned at last round         56
+wrong, gold paragraph missing, returned at last round    24
+no answer returned                                       17
+wrong, gold paragraph missing, stopped on agreement      10
+wrong, both gold present, stopped on agreement            7
+correct answers of ours: 186 | of which stopped on agreement: 51
+CORRECT STOP | Ferdinand Zvonimir von Habsburg is the eldest son of the head of which House | gold: House of Habsburg-Lorraine | pred: House of Habsburg-Lorraine | rounds: 1
+CORRECT STOP | Who was attempting to regain the British throne until the Raids on Lachaber and Shiramore shut down his operations? | gold: Charles Edward Stuart | pred: Charles Edward Stuart | rounds: 2
+CORRECT STOP | Which American actors and comedian played a New York City tailor in The Angel Levine? | gold: Zero Mostel | pred: Zero Mostel | rounds: 2
+            type                                               category                                                                                                                                     question                                          gold                       pred    f1  gold_paragraphs_found  rounds
+283       bridge       wrong, both gold present, returned at last round                  Jessica Ashley has recorded her own songs and has also written songs for which singer known for her song "Leave (Get Out)"?                        Joanna Noëlle Levesque                       JoJo  0.00                    1.0       3
+95    comparison    wrong, gold paragraph missing, stopped on agreement                                                                                              Who was born first David Draiman or Terry Kath?                         David Michael Draiman                 Terry Kath  0.00                    0.5       1
+939       bridge    wrong, gold paragraph missing, stopped on agreement  Who founded Methodism along with the man who was also part of the revival movement in England and the Great Awakening in the United States?                             George Whitefield                John Wesley  0.00                    0.5       1
+71        bridge       wrong, both gold present, returned at last round                                          Which of the role of Cindy Robinson was an anime adaptation of the "Blue Dragon" video game series?                                   Blue Dragon                       Zola  0.00                    1.0       3
+203       bridge                                     no answer returned                                                                    When was the author of "Albert Speer: His Battle with Truth"  convicted?                                           1968               INSUFFICIENT  0.00                    1.0       3
+735   comparison    wrong, gold paragraph missing, stopped on agreement                                                                    Which music group has the most members, DC Talk, or Manchester Orchestra?                          Manchester Orchestra                    DC Talk  0.00                    0.5       1
+1195      bridge       wrong, both gold present, returned at last round                   Dorothy Sarnoff's personal client list included what AMerican novelist, who has sold over 800 million copies of her books?  Danielle Fernandes Dominique Schuelein-Steel             Danielle Steel  0.33                    1.0       3
+187   comparison    wrong, gold paragraph missing, stopped on agreement                                                                     What occupation have Carly Gullickson and Francesca Schiavone both held?                   professional tennis player.             tennis players  0.40                    0.0       1
+971       bridge    wrong, gold paragraph missing, stopped on agreement                                                                              What sort of activist is the author of The Irrational Atheist?                                      alt-right                    atheist  0.00                    0.5       1
+23        bridge  wrong, gold paragraph missing, returned at last round                                                                               Who manages the Laboratory that ran the Aurora Generator Test?                      Battelle Energy Alliance  Idaho National Laboratory  0.00                    0.5       3
+407       bridge  wrong, gold paragraph missing, returned at last round                         The Minister for Defence Industry is currently the member of the Australian House of Representatives from what city?                                         Sturt                   Canberra  0.00                    0.5       3
+923       bridge  wrong, gold paragraph missing, returned at last round                                     In which year was this public research university in which Brock Marion played college football founded?                                          1874                       1993  0.00                    0.5       3
+
+===== ABLATION: half-pool windows =====
+           em     f1  recall  rounds    gen       tok
+method                                               
+ours    0.480  0.613   0.878   2.637  9.090  6937.163
+window  0.473  0.596   0.893   2.827  9.493  6115.977
+questions in both: 200 | F1 ours minus window: +0.029  95% CI [+0.000, +0.059]
+ours round 1 | answered 252 | all agree 41 -> 0.756 correct, 0.512 sufficient | not all 211 -> 0.550 correct
+window round 1 | answered 249 | all agree 21 -> 0.810 correct, 0.476 sufficient | not all 228 -> 0.583 correct

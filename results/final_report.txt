@@ -1,0 +1,26 @@
+===== FINAL RESULTS =====
+questions: 300
+           em     f1  recall  rounds    gen       tok
+method                                               
+fixed   0.473  0.612   0.927   3.000  3.000  3006.393
+ours    0.480  0.613   0.878   2.637  9.090  6937.163
+sc      0.463  0.592   0.843   1.703  6.463  5322.353
+single  0.367  0.482   0.715   1.000  1.000   720.290
+type    bridge  comparison
+method                    
+fixed    0.610       0.621
+ours     0.615       0.606
+sc       0.592       0.589
+single   0.466       0.540
+F1 ours minus fixed: +0.001  95% CI [-0.028, +0.032]
+F1 ours minus sc: +0.021  95% CI [-0.006, +0.051]
+F1 ours minus single: +0.130  95% CI [+0.087, +0.176]
+F1 sc minus fixed: -0.020  95% CI [-0.054, +0.010]
+sc round 1 | answered 252 | all agree 167 -> 0.695 correct | not all 85 -> 0.365 correct
+sc round 1 | pages enough on 0.480 | stops on 0.557 | right to stop 0.593 | catches 0.688
+sc all rounds | all agree 222 -> 0.698 correct | not all 135 -> 0.319 correct
+ours round 1 | answered 252 | all agree 41 -> 0.756 correct | not all 211 -> 0.550 correct
+ours round 1 | pages enough on 0.480 | stops on 0.137 | right to stop 0.512 | catches 0.146
+ours all rounds | all agree 68 -> 0.750 correct | not all 416 -> 0.567 correct
+
+minutes: 15.3 | unreadable replies: 0 of 795
